@@ -1,31 +1,183 @@
-# Use the latest 2.1 version of CircleCI pipeline process engine.
+# CircleCI pipeline for github-mcp-server
 # See: https://circleci.com/docs/reference/configuration-reference
 version: 2.1
 
-# Define a job to be invoked later in a workflow.
-# See: https://circleci.com/docs/guides/orchestrate/jobs-steps/#jobs-overview & https://circleci.com/docs/reference/configuration-reference/#jobs
-jobs:
-  say-hello:
-    # Specify the execution environment. You can specify an image from Docker Hub or use one of our convenience images from CircleCI's Developer Hub.
-    # See: https://circleci.com/docs/guides/execution-managed/executor-intro/ & https://circleci.com/docs/reference/configuration-reference/#executor-job
+# ─── Orbs ────────────────────────────────────────────────────────────────────
+orbs:
+  go: circleci/go@1.11.0
+  node: circleci/node@6.1.0
+
+# ─── Reusable executors ──────────────────────────────────────────────────────
+executors:
+  go-executor:
     docker:
-      # Specify the version you desire here
-      # See: https://circleci.com/developer/images/image/cimg/base
-      - image: cimg/base:current
+      - image: cimg/go:1.25.9
+    resource_class: medium
+  node-executor:
+    docker:
+      - image: cimg/node:20.19
+    resource_class: small
 
-    # Add steps to the job
-    # See: https://circleci.com/docs/guides/orchestrate/jobs-steps/#steps-overview & https://circleci.com/docs/reference/configuration-reference/#steps
+# ─── Reusable commands ───────────────────────────────────────────────────────
+commands:
+  restore-go-cache:
     steps:
-      # Checkout the code as the first step.
-      - checkout
-      - run:
-          name: "Say hello"
-          command: "echo Hello, World!"
+      - restore_cache:
+          keys:
+            - go-mod-v1-{{ checksum "go.sum" }}
+            - go-mod-v1-
 
-# Orchestrate jobs using workflows
-# See: https://circleci.com/docs/guides/orchestrate/workflows/ & https://circleci.com/docs/reference/configuration-reference/#workflows
+  save-go-cache:
+    steps:
+      - save_cache:
+          key: go-mod-v1-{{ checksum "go.sum" }}
+          paths:
+            - /home/circleci/go/pkg/mod
+            - /home/circleci/.cache/go-build
+
+  restore-npm-cache:
+    steps:
+      - restore_cache:
+          keys:
+            - npm-v1-{{ checksum "ui/package-lock.json" }}
+            - npm-v1-
+
+  save-npm-cache:
+    steps:
+      - save_cache:
+          key: npm-v1-{{ checksum "ui/package-lock.json" }}
+          paths:
+            - ui/node_modules
+
+# ─── Jobs ────────────────────────────────────────────────────────────────────
+jobs:
+  # Build the React/Vite UI and persist its output as a workspace artifact
+  build-ui:
+    executor: node-executor
+    steps:
+      - checkout
+      - restore-npm-cache
+      - run:
+          name: Install UI dependencies
+          command: cd ui && npm ci
+      - save-npm-cache
+      - run:
+          name: Build UI
+          command: script/build-ui
+      - persist_to_workspace:
+          root: .
+          paths:
+            - pkg/github/ui_dist
+
+  # Run Go unit tests with the race detector
+  test:
+    executor: go-executor
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - restore-go-cache
+      - run:
+          name: Download Go modules
+          command: go mod download
+      - save-go-cache
+      - run:
+          name: Verify module tidiness
+          command: go mod tidy && git diff --exit-code go.sum go.mod
+      - run:
+          name: Run unit tests
+          command: go test -race -count=1 ./...
+
+  # Run golangci-lint
+  lint:
+    executor: go-executor
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - restore-go-cache
+      - run:
+          name: Download Go modules
+          command: go mod download
+      - save-go-cache
+      - run:
+          name: Format check (gofmt)
+          command: |
+            UNFORMATTED=$(gofmt -s -l .)
+            if [ -n "$UNFORMATTED" ]; then
+              echo "The following files are not gofmt-formatted:"
+              echo "$UNFORMATTED"
+              exit 1
+            fi
+      - run:
+          name: Install golangci-lint
+          command: |
+            GOLANGCI_LINT_VERSION=v2.9.0
+            curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+              | sh -s -- -b /home/circleci/bin "$GOLANGCI_LINT_VERSION"
+      - run:
+          name: Run golangci-lint
+          command: /home/circleci/bin/golangci-lint run
+
+  # Compile the Go binary (validates the full build succeeds)
+  build-go:
+    executor: go-executor
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - restore-go-cache
+      - run:
+          name: Download Go modules
+          command: go mod download
+      - run:
+          name: Build binary
+          command: |
+            CGO_ENABLED=0 go build \
+              -ldflags="-s -w -X main.version=dev -X main.commit=$(git rev-parse HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              -o /tmp/github-mcp-server \
+              ./cmd/github-mcp-server
+
+  # Build the Docker image (no push) to validate the Dockerfile
+  docker-build:
+    docker:
+      - image: cimg/base:current
+    resource_class: medium
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+          docker_layer_caching: true
+      - run:
+          name: Build Docker image
+          command: |
+            docker build \
+              --build-arg VERSION=dev \
+              -t github-mcp-server:ci \
+              .
+
+# ─── Workflows ───────────────────────────────────────────────────────────────
 workflows:
-  say-hello-workflow: # This is the name of the workflow, feel free to change it to better match your workflow.
-    # Inside the workflow, you define the jobs you want to run.
+  ci:
     jobs:
-      - say-hello
+      # Build UI first; downstream jobs that need ui_dist attach the workspace
+      - build-ui
+
+      # Run test and lint in parallel once the UI is built
+      - test:
+          requires:
+            - build-ui
+      - lint:
+          requires:
+            - build-ui
+
+      # Compile the binary after tests and lint pass
+      - build-go:
+          requires:
+            - test
+            - lint
+
+      # Docker build runs after the Go binary compiles successfully
+      - docker-build:
+          requires:
+            - build-go
